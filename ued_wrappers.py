@@ -240,6 +240,8 @@ class AutoReplayState:
     env_state: EnvState
     level: Level
 
+    level_idx: int = -1
+
 
 class DistResetEnvWrapper(AutoResetEnvWrapper):
 
@@ -302,3 +304,42 @@ class DistResetEnvWrapper(AutoResetEnvWrapper):
     ):
         obs, env_state = self._env.reset_env_to_level(rng, level, params)
         return obs, AutoReplayState(env_state=env_state, level=level)
+
+
+class LearnabilityGradWrapper(DistResetEnvWrapper):
+    @partial(jax.jit, static_argnums=(0, 6))
+    def step_with_dist_reset(
+        self,
+        rng: chex.PRNGKey,
+        state: EnvState,
+        action: Union[int, float],
+        y: chex.Array, 
+        levels,
+        ret_table,
+        dones_table,
+        params = None,
+    ) -> Tuple[chex.ArrayTree, EnvState, float, bool, dict]:
+    
+        rng_reset, rng_step = jax.random.split(rng)
+
+        rng_reset, _rng = jax.random.split(rng_reset)
+        level_idx = jax.random.choice(_rng, len(y), p=y)
+        level = jax.tree_util.tree_map(lambda x: x[level_idx], levels)
+
+        obs_re, env_state_re = self._env.reset_env_to_level(rng_reset, level, params)
+        obs_st, env_state_st, reward, done, info = self._env.step(
+            rng_step, state.env_state, action, params
+        )
+        env_state = jax.tree_map(lambda x, y: jax.lax.select(done, x, y), env_state_re, env_state_st)
+        obs = jax.tree_map(lambda x, y: jax.lax.select(done, x, y), obs_re, obs_st)
+
+        # remember to update wrapper
+        ret = info["episode_return"]
+
+        state = state.replace(
+            env_state=env_state, 
+            grad = grad, 
+            level_idx = jax.lax.select(done, level_idx, state.level_idx)
+        )
+
+        return obs, state, reward, done, info, ret

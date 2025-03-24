@@ -46,6 +46,9 @@ class CustomTrainState(TrainState):
     y: jnp.ndarray
     y_opt_state: ScaleByTiAdaState
 
+    ret_table: jnp.ndarray
+    dones_table: jnp.ndarray
+
 class ScannedRNN(nn.Module):
     @functools.partial(
         nn.scan,
@@ -195,6 +198,10 @@ def make_train(config):
         # )
         y_ti_ada = scale_y_by_ti_ada(eta=config["META_LR"])
 
+        # init tables
+        dones_table = jnp.zeros(config["BUFFER_SIZE"])
+        ret_table = jnp.zeros((config["BUFFER_SIZE"], 10))
+
         rng, _rng = jax.random.split(rng)
         levels = jax.vmap(sample_random_level)(jax.random.split(_rng, config["BUFFER_SIZE"]))
         train_state = CustomTrainState.create(
@@ -203,7 +210,9 @@ def make_train(config):
             tx=tx,
             y = jnp.full(config["BUFFER_SIZE"], 1 / config["BUFFER_SIZE"]),
             y_opt_state = y_ti_ada.init(jnp.zeros(config["BUFFER_SIZE"])),
-            levels=levels
+            levels=levels,
+            ret_table = ret_table,
+            dones_table = dones_table
         )
 
         # INIT ENV
@@ -213,6 +222,7 @@ def make_train(config):
 
         rng, _rng = jax.random.split(rng)
         obsv, env_state = jax.vmap(dist_env.reset_env_to_level, in_axes=(0, 0, None))(jax.random.split(_rng, config["NUM_ENVS"]), levels, env_params)
+        env_state = env_state.replace(level_idx=level_idxs)
         init_hstate = ScannedRNN.initialize_carry(
             config["NUM_ENVS"], config["LAYER_SIZE"]
         )
@@ -246,12 +256,33 @@ def make_train(config):
 
                 # STEP ENV
                 rng, _rng = jax.random.split(rng)
-                obsv, env_state, reward, done, info =  jax.vmap(dist_env.step_with_dist_reset, in_axes=(0, 0, 0, None, None, None))(
+                obsv, env_state, reward, done, info, ret =  jax.vmap(dist_env.step_with_dist_reset, in_axes=(0, 0, 0, None, None, None))(
                     jax.random.split(_rng, config["NUM_ENVS"]), env_state, action, train_state.y, train_state.levels, env_params
                 )
                 transition = Transition(
                     last_done, action, value, reward, log_prob, last_obs, info
                 )
+
+                # update table
+                def _update_loop(tables, data):
+                    ret_table, dones_table = tables
+                    done, ret, level_idx = data
+
+                    
+                    new_history = jax.lax.select(dones_table[level_idx] != config["window_size"], ret_table[level_idx].at[dones_table[level_idx]].set(ret), jnp.roll(ret_table[level_idx], -1).at[-1].set(ret))
+
+                    history = jax.lax.select(done, new_history, ret_table[level_idx])
+                    ret_table.at[level_idx].set(history)
+                    dones_table.at[level_idx].add(done)
+
+                    return (ret_table, done_table), None
+
+                (ret_table, dones_table), _ = jax.lax.scan(_update_loop, (train_state.ret_table, train_state.dones_table), xs = (done, ret, level_idx))
+                train_state = train_state.replace(
+                    ret_table = ret_table,
+                    dones_table = dones_table,
+                )
+
                 runner_state = (
                     train_state,
                     env_state,
@@ -261,6 +292,7 @@ def make_train(config):
                     rng,
                     update_step,
                 )
+
                 return runner_state, transition
 
 
@@ -332,25 +364,20 @@ def make_train(config):
              ### NCC UPDATES ###
             def update_y(rng):
                 
-                def learnability_loop(rng, _):
-                    rng, _rng = jax.random.split(rng)
-                    return rng, score_fn(train_state, _rng)
-                
-                rng, _rng = jax.random.split(rng)
-                returns = jax.lax.scan(learnability_loop, _rng, None, 5)[1]
-                
-                num_samples = 5
+                returns = train_state.ret_table
+                ret_mask = jax.vmap(lambda num_dones: jnp.arange(10) < num_dones)(train_state.dones_table)
+                level_mask = (train_state.dones_table > 2)
 
                 def gaussian_pdf(x, mean, var):
                     return (1 / (jnp.sqrt(2 * jnp.pi) * var)) * jnp.exp(-0.5 * ((x - mean) / var) ** 2)
                 
-                mean_returns = jnp.mean(returns, axis=0)
-                mu = mean_returns.mean()
-                sigma_2 = mean_returns.var()
+                mean_returns = jnp.mean(returns, axis=0, where=ret_mask)
+                mu = mean_returns.mean(where=level_mask)
+                sigma_2 = mean_returns.var(where=level_mask)
                 
-                pdf_values = gaussian_pdf(mean_returns, mu, sigma_2)
+                pdf_values = jnp.where(level_mask, gaussian_pdf(mean_returns, mu, sigma_2), 0.0)
         
-                scores = jnp.sqrt(returns.var(axis=0)) / jnp.sqrt(num_samples) * pdf_values
+                scores = jax.lax.select(level_mask, jnp.sqrt(returns.var(axis=0, where=level_mask)) / jnp.sqrt(train_state.dones_table) * pdf_values)
 
                 y_fn = lambda y: y.T @ scores - config["META_REG"] * jnp.log(y + 1e-6).T @ y
                 grad, y_opt_state = y_ti_ada.update(jax.grad(y_fn)(train_state.y), train_state.y_opt_state)
@@ -379,7 +406,7 @@ def make_train(config):
 
             initial_hstate = runner_state[-3]
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, (train_state, *runner_state[1:]), None, config["NUM_STEPS"]
+                _env_step, (train_state, runner_state[2:]), None, config["NUM_STEPS"]
             )
 
             (
