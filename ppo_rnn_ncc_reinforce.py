@@ -387,7 +387,7 @@ def make_train(config):
                 return train_state.replace(
                     y = y,
                     y_opt_state = y_opt_state
-                ), 
+                )
 
             # CALCULATE ADVANTAGE
             (
@@ -572,7 +572,7 @@ def make_train(config):
             if config["DEBUG"] and config["USE_WANDB"]:
 
                 def callback(metric, update_step):
-                    to_log = create_log_dict(metric, config)
+                    to_log = create_log_dict(metric, config, adv_entropy=True)
                     batch_log(update_step, to_log, config)
 
                 jax.debug.callback(callback, metric, update_step)

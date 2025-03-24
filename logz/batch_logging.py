@@ -8,7 +8,7 @@ batch_logs = {}
 log_times = []
 
 
-def create_log_dict(info, config):
+def create_log_dict(info, config, adv_entropy=False):
     to_log = {
         "episode_return": info["returned_episode_returns"],
         "episode_length": info["returned_episode_lengths"],
@@ -31,6 +31,9 @@ def create_log_dict(info, config):
             to_log["icm_forward_loss"] = info["icm_forward_loss"]
         elif config.get("USE_RND"):
             to_log["rnd_loss"] = info["rnd_loss"]
+
+    if adv_entropy:
+        to_log["adv_entropy"] = info["adv_entropy"]
 
     return to_log
 
