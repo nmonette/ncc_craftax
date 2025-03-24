@@ -29,7 +29,8 @@ from ued_wrappers import (
     OptimisticResetVecEnvWrapper,
     BatchEnvWrapper,
     AutoResetEnvWrapper,
-    DistResetEnvWrapper
+    DistResetEnvWrapper,
+    LearnabilityGradWrapper
 )
 from logz.batch_logging import create_log_dict, batch_log
 
@@ -162,7 +163,8 @@ def make_train(config):
 
     # Wrap with a batcher, maybe using optimistic resets
     reset_env = AutoResetEnvWrapper(log_env)
-    dist_env = DistResetEnvWrapper(log_env)
+    # dist_env = DistResetEnvWrapper(log_env)
+    dist_env = LearnabilityGradWrapper(log_env)
     score_env = BatchEnvWrapper(log_env, num_envs=config["BUFFER_SIZE"])
 
     def linear_schedule(count):
@@ -199,8 +201,8 @@ def make_train(config):
         y_ti_ada = scale_y_by_ti_ada(eta=config["META_LR"])
 
         # init tables
-        dones_table = jnp.zeros(config["BUFFER_SIZE"])
-        ret_table = jnp.zeros((config["BUFFER_SIZE"], 10))
+        dones_table = jnp.zeros(config["BUFFER_SIZE"], dtype=int)
+        ret_table = jnp.zeros((config["BUFFER_SIZE"], config["WINDOW_SIZE"]))
 
         rng, _rng = jax.random.split(rng)
         levels = jax.vmap(sample_random_level)(jax.random.split(_rng, config["BUFFER_SIZE"]))
@@ -268,16 +270,15 @@ def make_train(config):
                     ret_table, dones_table = tables
                     done, ret, level_idx = data
 
-                    
-                    new_history = jax.lax.select(dones_table[level_idx] != config["window_size"], ret_table[level_idx].at[dones_table[level_idx]].set(ret), jnp.roll(ret_table[level_idx], -1).at[-1].set(ret))
+                    new_history = jax.lax.select(dones_table[level_idx] != config["WINDOW_SIZE"], ret_table[level_idx].at[dones_table[level_idx]].set(ret), jnp.roll(ret_table[level_idx], -1).at[-1].set(ret))
 
                     history = jax.lax.select(done, new_history, ret_table[level_idx])
-                    ret_table.at[level_idx].set(history)
-                    dones_table.at[level_idx].add(done)
+                    ret_table = ret_table.at[level_idx].set(history)
+                    dones_table = dones_table.at[level_idx].add(done)
 
-                    return (ret_table, done_table), None
+                    return (ret_table, dones_table), None
 
-                (ret_table, dones_table), _ = jax.lax.scan(_update_loop, (train_state.ret_table, train_state.dones_table), xs = (done, ret, level_idx))
+                (ret_table, dones_table), _ = jax.lax.scan(_update_loop, (train_state.ret_table, train_state.dones_table), xs = (done, ret, env_state.level_idx))
                 train_state = train_state.replace(
                     ret_table = ret_table,
                     dones_table = dones_table,
@@ -364,8 +365,8 @@ def make_train(config):
              ### NCC UPDATES ###
             def update_y(rng):
                 
-                returns = train_state.ret_table
-                ret_mask = jax.vmap(lambda num_dones: jnp.arange(10) < num_dones)(train_state.dones_table)
+                returns = train_state.ret_table.T
+                ret_mask = jax.vmap(lambda num_dones: jnp.arange(config["WINDOW_SIZE"]) < num_dones)(train_state.dones_table).T
                 level_mask = (train_state.dones_table > 2)
 
                 def gaussian_pdf(x, mean, var):
@@ -377,7 +378,7 @@ def make_train(config):
                 
                 pdf_values = jnp.where(level_mask, gaussian_pdf(mean_returns, mu, sigma_2), 0.0)
         
-                scores = jax.lax.select(level_mask, jnp.sqrt(returns.var(axis=0, where=level_mask)) / jnp.sqrt(train_state.dones_table) * pdf_values)
+                scores = jnp.where(level_mask, jnp.sqrt(returns.var(axis=0, where=level_mask)) / jnp.sqrt(train_state.dones_table) * pdf_values, 0.0)
 
                 y_fn = lambda y: y.T @ scores - config["META_REG"] * jnp.log(y + 1e-6).T @ y
                 grad, y_opt_state = y_ti_ada.update(jax.grad(y_fn)(train_state.y), train_state.y_opt_state)
@@ -386,7 +387,7 @@ def make_train(config):
                 return train_state.replace(
                     y = y,
                     y_opt_state = y_opt_state
-                )
+                ), 
 
             # CALCULATE ADVANTAGE
             (
@@ -400,13 +401,14 @@ def make_train(config):
             ) = runner_state
 
             rng, _rng = jax.random.split(rng)
-            train_state = jax.lax.cond(
-                unused % 16 == 0, update_y, lambda r: train_state, _rng
-            )
+            # train_state = jax.lax.cond(
+            #     unused % 16 == 0, update_y, lambda r: train_state, _rng
+            # )
+            train_state = update_y(_rng)
 
             initial_hstate = runner_state[-3]
             runner_state, traj_batch = jax.lax.scan(
-                _env_step, (train_state, runner_state[2:]), None, config["NUM_STEPS"]
+                _env_step, (train_state, *runner_state[1:]), None, config["NUM_STEPS"]
             )
 
             (
@@ -564,6 +566,8 @@ def make_train(config):
                 / traj_batch.info["returned_episode"].sum(),
                 traj_batch.info,
             )
+            metric["adv_entropy"] = train_state.y.T @ jnp.log(train_state.y + 1e-6)
+
             rng = update_state[-1]
             if config["DEBUG"] and config["USE_WANDB"]:
 
@@ -692,6 +696,7 @@ if __name__ == "__main__":
 
     # NCC Stuff
     parser.add_argument("--buffer_size", type=int, default=4000)
+    parser.add_argument("--window_size", type=int, default=5)
     parser.add_argument("--meta_trunc", type=float, default=1e-5)
     parser.add_argument("--meta_reg", type=float, default=0.1)
     parser.add_argument("--meta_lr", type=float, default=1e-2)

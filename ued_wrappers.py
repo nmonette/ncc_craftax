@@ -315,8 +315,6 @@ class LearnabilityGradWrapper(DistResetEnvWrapper):
         action: Union[int, float],
         y: chex.Array, 
         levels,
-        ret_table,
-        dones_table,
         params = None,
     ) -> Tuple[chex.ArrayTree, EnvState, float, bool, dict]:
     
@@ -334,11 +332,10 @@ class LearnabilityGradWrapper(DistResetEnvWrapper):
         obs = jax.tree_map(lambda x, y: jax.lax.select(done, x, y), obs_re, obs_st)
 
         # remember to update wrapper
-        ret = info["episode_return"]
+        ret = state.env_state.episode_returns
 
         state = state.replace(
             env_state=env_state, 
-            grad = grad, 
             level_idx = jax.lax.select(done, level_idx, state.level_idx)
         )
 
